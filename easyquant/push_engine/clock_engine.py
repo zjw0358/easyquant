@@ -3,6 +3,7 @@ import datetime
 from collections import deque
 from threading import Thread
 
+import pandas as pd
 import arrow
 from dateutil import tz
 
@@ -48,16 +49,18 @@ class ClockIntervalHandler:
 
 
 class ClockMomentHandler:
-    def __init__(self, clock_engine, clock_type, moment=None, makeup=False, call=None):
+    def __init__(self, clock_engine, clock_type, moment=None, is_trading_date=True, makeup=False, call=None):
         """
         :param clock_type:
         :param moment: datetime.time
+        :param is_trading_date: bool(是否只有在交易日触发)
         :param makeup: 注册时,如果已经过了触发时机,是否立即触发
         :return:
         """
         self.clock_engine = clock_engine
         self.clock_type = clock_type
         self.moment = moment
+        self.is_trading_date = is_trading_date
         self.makeup = makeup
         self.call = call or (lambda: None)
         self.next_time = datetime.datetime.combine(
@@ -74,12 +77,20 @@ class ClockMomentHandler:
         :return:
         """
         if self.is_active():
+            if self.is_trading_date:
+                next_date = etime.get_next_trade_date(self.clock_engine.now_dt)
+            else:
+                next_date = self.next_time.date() + datetime.timedelta(days=1)
+
             self.next_time = datetime.datetime.combine(
-                    self.next_time.date() + datetime.timedelta(days=1),
+                    next_date,
                     self.moment
             )
 
     def is_active(self):
+        if self.is_trading_date and not etime.is_trade_date(self.clock_engine.now_dt):
+            # 仅在交易日触发时的判断
+            return False
         return self.next_time <= self.clock_engine.now_dt
 
 
@@ -90,7 +101,7 @@ class ClockEngine:
     """
     EventType = 'clock_tick'
 
-    def __init__(self, event_engine, now=None, tzinfo=None):
+    def __init__(self, event_engine, tzinfo=None):
         """
         :param event_engine:
         :param event_engine: tzinfo
@@ -98,14 +109,12 @@ class ClockEngine:
         """
         # 默认使用当地时间的时区
         self.tzinfo = tzinfo or tz.tzlocal()
-        # 引擎启动的时间,默认为当前.测试时可手动设置模拟各个时间段.
-        self.time_delta = self._delta(now)
-        # self.start_time = self.now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
         self.event_engine = event_engine
         self.is_active = True
-        self.clock_engine_thread = Thread(target=self.clocktick)
+        self.clock_engine_thread = Thread(target=self.clocktick, name="ClockEngine.clocktick")
         self.sleep_time = 1
-        self.trading_state = True if etime.is_tradetime(datetime.datetime.now()) else False
+        self.trading_state = True if (etime.is_tradetime(datetime.datetime.now()) and etime.is_trade_date(datetime.datetime.now())) else False
         self.clock_moment_handlers = deque()
         self.clock_interval_handlers = set()
 
@@ -118,36 +127,26 @@ class ClockEngine:
         """
 
         # 开盘事件
-        def open_():
+        def _open():
             self.trading_state = True
 
-        self._register_moment('open', datetime.time(9, tzinfo=self.tzinfo), True, open_)
+        self._register_moment('open', datetime.time(9, tzinfo=self.tzinfo), makeup=True, call=_open)
 
         # 中午休市
-        self._register_moment('pause', datetime.time(11, 30, tzinfo=self.tzinfo), True)
+        self._register_moment('pause', datetime.time(11, 30, tzinfo=self.tzinfo), makeup=True)
 
         # 下午开盘
-        self._register_moment('continue', datetime.time(13, tzinfo=self.tzinfo), True)
+        self._register_moment('continue', datetime.time(13, tzinfo=self.tzinfo), makeup=True)
 
         # 收盘事件
         def close():
             self.trading_state = False
 
-        self._register_moment('close', datetime.time(15, tzinfo=self.tzinfo), True, close)
+        self._register_moment('close', datetime.time(15, tzinfo=self.tzinfo), makeup=True, call=close)
 
         # 间隔事件
         for interval in (0.5, 1, 5, 15, 30, 60):
             self.register_interval(interval)
-
-    def _delta(self, now):
-        if now is None:
-            return 0
-        if now.tzinfo is None:
-            now = arrow.get(datetime.datetime(
-                    now.year, now.month, now.day, now.hour, now.minute, now.second, now.microsecond, self.tzinfo,
-            ))
-
-        return (arrow.now() - now).total_seconds()
 
     @property
     def now(self):
@@ -155,7 +154,7 @@ class ClockEngine:
         now 时间戳统一接口
         :return:
         """
-        return time.time() - self.time_delta
+        return time.time()
 
     @property
     def now_dt(self):
@@ -163,9 +162,6 @@ class ClockEngine:
         :return: datetime 类型, 带时区的时间戳.建议使用 arrow 库
         """
         return arrow.get(self.now).to(self.tzinfo)
-
-    def reset_now(self, now=None):
-        self.time_delta = self._delta(now)
 
     def start(self):
         self.clock_engine_thread.start()
@@ -176,7 +172,7 @@ class ClockEngine:
             time.sleep(self.sleep_time)
 
     def tock(self):
-        if etime.is_holiday(self.now_dt):
+        if not etime.is_trade_date(self.now_dt):
             pass  # 假日暂停时钟引擎
         else:
             self._tock()
@@ -213,11 +209,11 @@ class ClockEngine:
         return etime.is_tradetime(self.now_dt)
 
     def register_moment(self, clock_type, moment, makeup=False):
-        return self._register_moment(clock_type, moment, makeup)
+        return self._register_moment(clock_type, moment, makeup=makeup)
 
-    def _register_moment(self, clock_type, moment, makeup=False, call=None):
+    def _register_moment(self, clock_type, moment, is_trading_date=True, makeup=False, call=None):
         handlers = list(self.clock_moment_handlers)
-        handler = ClockMomentHandler(self, clock_type, moment, makeup, call)
+        handler = ClockMomentHandler(self, clock_type, moment, is_trading_date, makeup, call)
         handlers.append(handler)
 
         # 触发事件重新排序
